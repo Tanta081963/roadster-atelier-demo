@@ -1,0 +1,10 @@
+require('dotenv').config();
+const {DatabaseSync,backup}=require('node:sqlite');
+const fs=require('node:fs');
+const path=require('node:path');
+const source=path.resolve(process.env.DATABASE_FILE||'./data/reservations.sqlite');
+const target=process.argv[2] && path.resolve(process.argv[2]);
+if(!target||target===source||fs.existsSync(target))throw Error('Provide a new backup filename different from the live database. Existing files are never overwritten.');
+fs.mkdirSync(path.dirname(target),{recursive:true});
+const db=new DatabaseSync(source,{readOnly:true});
+backup(db,target).then(()=>{db.close();console.log('Consistent SQLite backup created. Store a copy separately from the service disk.');}).catch(e=>{db.close();console.error(e.message);process.exitCode=1;});
