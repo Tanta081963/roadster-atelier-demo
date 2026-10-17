@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: roadster-atelier-demo
+    runtime: docker
+    plan: starter
+    healthCheckPath: /api/health
+    disk:
+      name: reservations
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      - key: TRUST_PROXY
+        value: 1
+      - key: DATABASE_FILE
+        value: /var/data/reservations.sqlite
+      - key: ADMIN_USERNAME
+        value: admin
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true
