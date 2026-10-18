@@ -17,6 +17,7 @@ test('reservation lifecycle, authentication, privacy, validation and restart per
  async function req(url,method='GET',body,admin=false){return fetch(base+url,{method,headers:{...(body?{'Content-Type':'application/json'}:{}),...(admin?{'X-Requested-With':'RoadsterAdmin',Cookie:cookie||''}:{})},body:body?JSON.stringify(body):undefined});}
  try{
   await start();
+  for(let i=0;i<85;i++) assert.equal((await req('/api/health')).status,200);
   assert.equal((await req('/api/admin/stats')).status,401);
   assert.equal((await req('/api/admin/login','POST',{username:'admin',password})).status,403);
   let r=await req('/api/admin/login','POST',{username:'admin',password:'wrong'},true);assert.equal(r.status,401);
@@ -35,6 +36,8 @@ test('reservation lifecycle, authentication, privacy, validation and restart per
   await stop();await start();
   r=await req('/api/reservations/'+record.reference);assert.equal((await r.json()).reservation.status,'confirmed');
   r=await req('/api/admin/stats','GET',null,true);assert.equal((await r.json()).total,1);
+  assert.equal((await req('/api/admin/export')).status,401);
+  r=await req('/api/admin/export','GET',null,true);assert.match(r.headers.get('content-disposition'),/attachment/);const backup=await r.json();assert.equal(backup.reservations[0].reference,record.reference);assert.equal(backup.reservations[0].token_hash,undefined);
   assert.equal((await req('/api/missing')).status,404);
   assert.equal((await req('/.env')).status,404);
   assert.equal((await req('/api/admin/logout','POST',{},true)).status,200);
