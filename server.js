@@ -2,7 +2,7 @@ require("dotenv").config();
 const express = require("express");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
-const { DatabaseSync: Database } = require("node:sqlite");
+const {createDatabase}=require("./database");
 const crypto = require("crypto");
 const path = require("path");
 const fs = require("fs");
@@ -23,11 +23,9 @@ if (!ADMIN_PASSWORD || !SESSION_SECRET) {
   console.warn("DEVELOPMENT WARNING: Set ADMIN_PASSWORD and SESSION_SECRET in .env before exposing this app to a network.");
 }
 
-fs.mkdirSync(path.dirname(path.resolve(DB_FILE)), { recursive: true });
-const db = new Database(DB_FILE);
-db.exec("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;");
-db.exec("PRAGMA foreign_keys = ON");
-db.exec(`
+async function main(){
+const db = await createDatabase();
+await db.exec(`
 CREATE TABLE IF NOT EXISTS reservations (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   reference TEXT NOT NULL UNIQUE,
@@ -45,8 +43,8 @@ CREATE INDEX IF NOT EXISTS idx_reservations_email ON reservations(email);
 CREATE INDEX IF NOT EXISTS idx_reservations_status ON reservations(status);
 CREATE TABLE IF NOT EXISTS admin_sessions (
   token_hash TEXT PRIMARY KEY,
-  created_at INTEGER NOT NULL,
-  expires_at INTEGER NOT NULL
+  created_at BIGINT NOT NULL,
+  expires_at BIGINT NOT NULL
 );
 `);
 
@@ -77,7 +75,7 @@ app.use(helmet({
 app.use(express.json({ limit: "20kb" }));
 app.use(express.urlencoded({ extended: false, limit: "20kb" }));
 
-const apiLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 80, standardHeaders: true, legacyHeaders: false, message:{error:'Too many requests. Please try again later.'} });
+const apiLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 80, skip: req => req.path === '/health', standardHeaders: true, legacyHeaders: false, message:{error:'Too many requests. Please try again later.'} });
 const reservationLimiter = rateLimit({ windowMs: 60 * 60 * 1000, limit: 8, standardHeaders: true, legacyHeaders: false,
   message: { error: "Too many attempts. Please wait and try again later." } });
 app.use("/api", apiLimiter);
@@ -94,12 +92,12 @@ const safeEqual = (a, b) => {
   return aa.length === bb.length && crypto.timingSafeEqual(aa, bb);
 };
 
-function adminAuth(req, res, next) {
+async function adminAuth(req, res, next) {
   const token = sessionToken(req);
   if (!token) return res.status(401).json({ error: "Admin authentication required." });
-  const row = db.prepare("SELECT expires_at FROM admin_sessions WHERE token_hash = ?").get(hashToken(token));
+  const row = await db.prepare("SELECT expires_at FROM admin_sessions WHERE token_hash = ?").get(hashToken(token));
   if (!row || row.expires_at < Date.now()) {
-    if (row) db.prepare("DELETE FROM admin_sessions WHERE token_hash = ?").run(hashToken(token));
+    if (row) await db.prepare("DELETE FROM admin_sessions WHERE token_hash = ?").run(hashToken(token));
     return res.status(401).json({ error: "Session expired. Please sign in again." });
   }
   next();
@@ -107,7 +105,7 @@ function adminAuth(req, res, next) {
 
 app.get("/api/health", (req, res) => res.json({ ok: true, service: "reservation-prototype", time: nowISO() }));
 
-app.post("/api/reservations", reservationLimiter, (req, res) => {
+app.post("/api/reservations", reservationLimiter, async (req, res) => {
   const body = req.body || {};
   for (const [field,max] of Object.entries({firstName:60,lastName:60,email:254,country:80,configuration:30})) {
     if (typeof body[field] !== 'string' || body[field].length > max) return res.status(400).json({error:'Invalid or oversized field: '+field});
@@ -133,7 +131,7 @@ app.post("/api/reservations", reservationLimiter, (req, res) => {
   const reference = "RD-" + crypto.randomBytes(12).toString("hex").toUpperCase();
   const now = nowISO();
   try {
-    db.prepare(`INSERT INTO reservations
+    await db.prepare(`INSERT INTO reservations
       (reference, first_name, last_name, email, country, contact_preference, configuration, status, created_at, updated_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`)
       .run(reference, firstName, lastName, email, country, contactPreference, configuration, now, now);
@@ -148,16 +146,16 @@ app.post("/api/reservations", reservationLimiter, (req, res) => {
   });
 });
 
-app.get("/api/reservations/:reference", (req, res) => {
+app.get("/api/reservations/:reference", async (req, res) => {
   const reference = clean(req.params.reference, 40).toUpperCase();
-  const row = db.prepare(`SELECT reference, configuration, status, created_at
+  const row = await db.prepare(`SELECT reference, configuration, status, created_at
     FROM reservations WHERE reference = ?`).get(reference);
   if (!row) return res.status(404).json({ error: "No demo reservation was found for that reference." });
   res.json({ reservation: { reference: row.reference, configuration: row.configuration, status: row.status, createdAt: row.created_at },
     notice: "Demo status only. This is not a real Tesla reservation." });
 });
 
-app.post("/api/admin/login", rateLimit({ windowMs: 15 * 60 * 1000, limit: 8, standardHeaders: true, legacyHeaders: false, message:{error:'Too many login attempts. Try again in 15 minutes.'} }), (req, res) => {
+app.post("/api/admin/login", rateLimit({ windowMs: 15 * 60 * 1000, limit: 8, standardHeaders: true, legacyHeaders: false, message:{error:'Too many login attempts. Try again in 15 minutes.'} }), async (req, res) => {
   const username = String(req.body?.username || "");
   const password = String(req.body?.password || "");
   if (!ADMIN_PASSWORD || !SESSION_SECRET || !safeEqual(username, ADMIN_USERNAME) || !safeEqual(password, ADMIN_PASSWORD)) {
@@ -166,34 +164,39 @@ app.post("/api/admin/login", rateLimit({ windowMs: 15 * 60 * 1000, limit: 8, sta
   const token = crypto.randomBytes(32).toString("base64url");
   const createdAt = Date.now();
   const expiresAt = createdAt + 8 * 60 * 60 * 1000;
-  db.prepare("INSERT INTO admin_sessions (token_hash, created_at, expires_at) VALUES (?, ?, ?)")
+  await db.prepare("INSERT INTO admin_sessions (token_hash, created_at, expires_at) VALUES (?, ?, ?)")
     .run(hashToken(token), createdAt, expiresAt);
-  db.prepare("DELETE FROM admin_sessions WHERE expires_at < ?").run(Date.now());
+  await db.prepare("DELETE FROM admin_sessions WHERE expires_at < ?").run(Date.now());
   res.cookie("roadster_session", token, cookieOptions);
   res.json({ ok: true, expiresAt });
 });
 
-app.post("/api/admin/logout", adminAuth, (req, res) => {
+app.post("/api/admin/logout", adminAuth, async (req, res) => {
   const token = sessionToken(req);
   res.clearCookie("roadster_session", {...cookieOptions,maxAge:undefined});
-  db.prepare("DELETE FROM admin_sessions WHERE token_hash = ?").run(hashToken(token));
+  await db.prepare("DELETE FROM admin_sessions WHERE token_hash = ?").run(hashToken(token));
   res.json({ ok: true });
 });
 
-app.get("/api/admin/stats", adminAuth, (req, res) => {
-  const total = db.prepare("SELECT COUNT(*) AS count FROM reservations").get().count;
-  const byStatus = db.prepare("SELECT status, COUNT(*) AS count FROM reservations GROUP BY status").all();
-  const byConfiguration = db.prepare("SELECT configuration, COUNT(*) AS count FROM reservations GROUP BY configuration").all();
+app.get("/api/admin/stats", adminAuth, async (req, res) => {
+  const total = Number((await db.prepare("SELECT COUNT(*) AS count FROM reservations").get()).count);
+  const byStatus = await db.prepare("SELECT status, COUNT(*) AS count FROM reservations GROUP BY status").all();
+  const byConfiguration = await db.prepare("SELECT configuration, COUNT(*) AS count FROM reservations GROUP BY configuration").all();
   res.json({ total, byStatus, byConfiguration });
 });
 
-app.delete('/api/admin/reservations/:reference', adminAuth, (req,res)=>{
-  const result=db.prepare('DELETE FROM reservations WHERE reference = ?').run(req.params.reference.toUpperCase());
+app.get('/api/admin/export',adminAuth,async(req,res)=>{
+  const records=await db.prepare('SELECT reference, first_name, last_name, email, country, contact_preference, configuration, status, created_at, updated_at FROM reservations ORDER BY created_at').all();
+  res.attachment('roadster-reservations.json').json({version:1,exportedAt:nowISO(),reservations:records});
+});
+
+app.delete('/api/admin/reservations/:reference', adminAuth, async (req,res)=>{
+  const result=await db.prepare('DELETE FROM reservations WHERE reference = ?').run(req.params.reference.toUpperCase());
   if(!result.changes) return res.status(404).json({error:'Reservation not found.'});
   res.json({ok:true});
 });
 
-app.get("/api/admin/reservations", adminAuth, (req, res) => {
+app.get("/api/admin/reservations", adminAuth, async (req, res) => {
   const search = clean(req.query.search, 100);
   const status = clean(req.query.status, 20);
   const config = clean(req.query.configuration, 30);
@@ -209,18 +212,18 @@ app.get("/api/admin/reservations", adminAuth, (req, res) => {
   if (statuses.has(status)) { where.push("status = ?"); params.push(status); }
   if (configurations.has(config)) { where.push("configuration = ?"); params.push(config); }
   const clause = where.length ? "WHERE " + where.join(" AND ") : "";
-  const total = db.prepare(`SELECT COUNT(*) AS count FROM reservations ${clause}`).get(...params).count;
-  const rows = db.prepare(`SELECT reference, first_name AS firstName, last_name AS lastName, email, country,
-    contact_preference AS contactPreference, configuration, status, created_at AS createdAt, updated_at AS updatedAt
+  const total = Number((await db.prepare(`SELECT COUNT(*) AS count FROM reservations ${clause}`).get(...params)).count);
+  const rows = await db.prepare(`SELECT reference, first_name AS "firstName", last_name AS "lastName", email, country,
+    contact_preference AS "contactPreference", configuration, status, created_at AS "createdAt", updated_at AS "updatedAt"
     FROM reservations ${clause} ORDER BY created_at DESC LIMIT ? OFFSET ?`).all(...params, limit, (page - 1) * limit);
   res.json({ reservations: rows, page, limit, total });
 });
 
-app.patch("/api/admin/reservations/:reference", adminAuth, (req, res) => {
+app.patch("/api/admin/reservations/:reference", adminAuth, async (req, res) => {
   const reference = clean(req.params.reference, 30).toUpperCase();
   const status = clean(req.body?.status, 20);
   if (!statuses.has(status)) return res.status(400).json({ error: "Invalid status." });
-  const result = db.prepare("UPDATE reservations SET status = ?, updated_at = ? WHERE reference = ?").run(status, nowISO(), reference);
+  const result = await db.prepare("UPDATE reservations SET status = ?, updated_at = ? WHERE reference = ?").run(status, nowISO(), reference);
   if (!result.changes) return res.status(404).json({ error: "Reservation not found." });
   res.json({ ok: true, reference, status });
 });
@@ -234,4 +237,7 @@ app.use((err, req, res, next) => {
 });
 
 const server = app.listen(PORT, process.env.HOST || '127.0.0.1', () => console.log('Roadster demo listening on port ' + server.address().port));
-for (const signal of ['SIGTERM','SIGINT']) process.on(signal,()=>server.close(()=>{db.close();process.exit(0);}));
+for (const signal of ['SIGTERM','SIGINT']) process.on(signal,()=>server.close(async ()=>{await db.close();process.exit(0);}));
+
+}
+main().catch(error=>{console.error("Startup failed:",error.message);process.exit(1);});
